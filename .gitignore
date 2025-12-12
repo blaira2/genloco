@@ -1,0 +1,11 @@
+/.ipynb_checkpoints
+*.pyc
+/logs_quad_multi
+/quad_videos
+/norms
+/logs_quadrl_m0
+/logs_ppo_with_imitation
+/logs_quadrl_m2
+/logs_quadrl_m3
+*.npz
+
