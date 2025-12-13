@@ -13,7 +13,7 @@ matplotlib
 tensorboard
 tqdm
 
-### install dependencies:
+### Install Dependencies:
 pip install -r requirements.txt
 
 The code is primarily divided into 3 files:
@@ -24,6 +24,7 @@ The code is primarily divided into 3 files:
   : The model learns to generate future pose sequences conditioned on morphology and past observations.
 - morphSNN.py
   : Train PPO using the ALIF-based SNN feature extractor and diffusion-generated motion priors:
+- custom mujoco environments (quadruped*.xml) are provided for training
 
 ### Notebooks
 Code for training both the RL and Diffusion models is setup in the Train.ipynb notebook
