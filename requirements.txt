@@ -1,0 +1,9 @@
+numpy
+torch
+gymnasium[mujoco]
+mujoco
+stable-baselines3
+snntorch
+matplotlib
+tensorboard
+tqdm
