@@ -90,6 +90,18 @@ def train_ppo_with_pose_template(run_name: str,
         end_fraction=0.9
     )
 
+    imit_schedule = LinearSchedule(
+        start=0.0,
+        end=1.0,
+        end_fraction=0.4
+    )
+
+    energy_schedule = LinearSchedule(
+        start=0.001,
+        end=0.007,
+        end_fraction=0.6
+    )
+
     morph_specs = [(xml_path, morph_vec)]
     video_cb = VideoEveryNEpisodesCallback(
         video_every=250,
@@ -102,6 +114,12 @@ def train_ppo_with_pose_template(run_name: str,
     )
 
     reward_cb = RewardDebugCallback(verbose=1)
+
+    sched_cb = WeightScheduleCallback(
+        imitation_schedule=imit_schedule,
+        energy_schedule=energy_schedule,
+        verbose=1
+    )
 
     # --------- PPO model ---------
     policy_kwargs = dict(
@@ -130,7 +148,7 @@ def train_ppo_with_pose_template(run_name: str,
     model.set_logger(logger)
 
     print(f"\n🚀 Training PPO with pose templates for {run_name} ...")
-    model.learn(total_timesteps=timesteps,callback=[video_cb, reward_cb])
+    model.learn(total_timesteps=timesteps,callback=[video_cb, reward_cb, sched_cb])
     print(f"Training complete for {run_name}")
 
     model.save(f"{run_name}_ppo.zip")
@@ -229,7 +247,6 @@ def train_ppo_multi_morphologies( run_name: str,
     )
     reward_cb = RewardDebugCallback(verbose=1)
 
-
     # SNN policy
     policy_kwargs = dict(
         features_extractor_class=SNNFeatureExtractor,
@@ -306,15 +323,28 @@ class MorphPhaseEnvWrapper(gym.Env):
 
         self.base_obs_space = base_env.observation_space
         self.action_space = base_env.action_space
+        self.act_dim = int(np.prod(self.base_env.action_space.shape))  # only Mujoco env actions
+        base_low = self.base_env.action_space.low.astype(np.float32)
+        base_high = self.base_env.action_space.high.astype(np.float32)
+
+        a_low = np.concatenate([base_low, np.array([-1.0], dtype=np.float32)])
+        a_high = np.concatenate([base_high, np.array([+1.0], dtype=np.float32)])
+        self.action_space = gym.spaces.Box(low=a_low, high=a_high, dtype=np.float32)
 
         self.pose_generator = pose_generator
         self.imitation_weight = imitation_w
+        self.energy_weight = .007
         # which part of base_obs we compare to the template (e.g. joint angles)
         self.imitation_obs_indices = imitation_obs_indices
 
+        #phase dimensions
+        self._phase = 0.0
+        self.min_phase_speed = 0.01
+        self.max_phase_speed = 0.08
         morph_dim = self.morph_vec.shape[0]
         extra_dim = morph_dim + 2
 
+        #obs
         obs_space_low = self.base_obs_space.low.astype(np.float32)
         obs_space_high = self.base_obs_space.high.astype(np.float32)
 
@@ -328,15 +358,14 @@ class MorphPhaseEnvWrapper(gym.Env):
 
         # approximate sim timestep
         self.dt = getattr(self.base_env.unwrapped, "dt", 1.0 / 60.0)
-        self.no_progress_time_limit = 1.0  # seconds with no progress
+        self.no_progress_time_limit = 2.5  # seconds with no progress
         self.min_progress = 0.01  # how much x must increase to count
         self._time_since_progress = 0.0
         self._last_progress_x = None
 
 
-
     def _compute_phase(self):
-        return (self._step_count % self.cycle_steps) / float(self.cycle_steps)
+        return float(self._phase % 1.0)
 
     def _augment_obs(self, base_obs):
         base_obs = np.asarray(base_obs, dtype=np.float32)
@@ -346,6 +375,13 @@ class MorphPhaseEnvWrapper(gym.Env):
             dtype=np.float32
         )
         return np.concatenate([base_obs, self.morph_vec, phase_feat], axis=0)
+
+    def set_imitation_weight(self, w: float):
+        self.imitation_weight = float(w)
+
+    def set_energy_weight(self, w: float):
+        # you currently hardcode energy_w inside step(); move it to self.energy_weight first (see below)
+        self.energy_weight = float(w)
 
     #  Get x position of the body from the underlying  env
     def _get_forward_position(self):
@@ -359,35 +395,43 @@ class MorphPhaseEnvWrapper(gym.Env):
     def _is_flipped(self):
         try:
             env = self.base_env.unwrapped
-            data = env.data  # MjData
+            data = env.data
 
             # rotation matrix for root body (id=1): 9 numbers, row-major
             # xmat[i] is a flat 3x3; columns are world-frame axes of the body
             xmat = data.xmat[self._root_body_id].reshape(3, 3)
             z_world = xmat[:, 2]  # body's local +Z in world coords
 
-            # dot with world +Z = [0, 0, 1]
             cos_tilt = float(z_world[2])
 
             return cos_tilt < self.flip_cos_threshold
         except Exception:
-            # If anything goes wrong, be conservative and say "not flipped"
             return False
 
     def reset(self, **kwargs):
         base_obs, info = self.base_env.reset(**kwargs)
+
+        model = self.base_env.unwrapped.model
+        dt = model.opt.timestep * self.base_env.unwrapped.frame_skip
+
+        print(
+            f"[Env timing] mujoco_dt={model.opt.timestep:.6f}, "
+            f"frame_skip={self.base_env.unwrapped.frame_skip}, "
+            f"env_dt={dt:.6f} sec"
+        )
+
         #Physics settling
         if self.settle_steps > 0:
-            zero_action = np.zeros(self.action_space.shape, dtype=np.float32)
+            zero_action = np.zeros(self.act_dim, dtype=np.float32)
             for _ in range(self.settle_steps):
                 base_obs, _, terminated, truncated, _ = self.base_env.step(zero_action)
-
                 # If env terminates during settle reset again
                 if terminated or truncated:
                     base_obs, info = self.base_env.reset(**kwargs)
         if self.xml_path is not None:
             info["xml_path"] = self.xml_path
         self._step_count = 0
+        self._phase = 0.0
         self._time_since_progress = 0.0
         x0 = self._get_forward_position()
         self._x_start = x0
@@ -397,7 +441,21 @@ class MorphPhaseEnvWrapper(gym.Env):
 
     def step(self, action):
         self._step_count += 1
-        base_obs, reward, terminated, truncated, info = self.base_env.step(action)
+        #phase control
+        action = np.asarray(action, dtype=np.float32)
+        base_action = action[:self.act_dim]
+        if action.shape[0] > self.act_dim:
+            # new policy: includes phase control
+            phase_ctrl = float(action[self.act_dim])
+            phase_speed = self.min_phase_speed + (phase_ctrl + 1.0) * 0.5 * (
+                        self.max_phase_speed - self.min_phase_speed)
+        else:
+            # old policy: no phase control
+            phase_ctrl = 0.0
+            phase_speed = 0.5 * (self.min_phase_speed + self.max_phase_speed)  # default mid-speed
+
+        self._phase = (self._phase + phase_speed) % 1.0
+        base_obs, reward, terminated, truncated, info = self.base_env.step(base_action)
 
         x = self._get_forward_position()
         if self._last_progress_x is None:
@@ -408,7 +466,7 @@ class MorphPhaseEnvWrapper(gym.Env):
         delta_x = x - self._last_progress_x  # forward movement
         total_progress = x - self._x_start
 
-        energy_w = .007
+        #self.energy_weight
         forward_w = 6  # applied twice: used for total_progress too
         velocity_w = 1.1
         alive_bonus = .1
@@ -417,7 +475,7 @@ class MorphPhaseEnvWrapper(gym.Env):
         action = np.asarray(action, dtype=np.float32)
         speed = delta_x / self.dt
         pos_speed = max(speed, 0)
-        energy_penalty = energy_w * float(np.sum(action ** 2))
+        energy_penalty = self.energy_weight * float(np.sum(base_action ** 2))
         forward_reward = forward_w * delta_x
         log_vel_reward = velocity_w * np.log(1.0 + pos_speed)
         if speed < 0:
@@ -434,17 +492,14 @@ class MorphPhaseEnvWrapper(gym.Env):
             # pose_generator should return a *base_env-style pose* for this morph & phase
             target_pose = self.pose_generator(self.morph_vec, phase)
             target_pose = np.asarray(target_pose, dtype=np.float32)
-
             current_pose = np.asarray(base_obs, dtype=np.float32)
 
-            # Optionally restrict to some obs indices (e.g. joint angles only)
+            # joint angles only
             if self.imitation_obs_indices is not None:
                 current_pose = current_pose[self.imitation_obs_indices]
                 if target_pose.shape[0] == len(self.imitation_obs_indices):
-                    # already reduced; use as-is
                     pass
                 else:
-                    # assume target_pose is in full obs space; apply indices
                     target_pose = target_pose[self.imitation_obs_indices]
 
             # make sure same length (in case of slight mismatch)
@@ -458,7 +513,6 @@ class MorphPhaseEnvWrapper(gym.Env):
                 reward += imitation_reward
                 info["imitation_reward"] = imitation_reward
                 info["pose_mse"] = pose_mse
-
 
         # no-forward-progress termination
         info["fail_penalty"] = 0
@@ -489,6 +543,7 @@ class MorphPhaseEnvWrapper(gym.Env):
         info["energy_penalty"] = energy_penalty
         info["alive_reward"] = alive_bonus
         info["velocity_reward"] = log_vel_reward
+        info["phase_speed"] = phase_speed
 
         info["delta_x"] = delta_x
 
@@ -602,6 +657,9 @@ def collect_quadruped_morph_trajectories(ppo_path: str,
     all_act   = []
     all_rew   = []
     all_morph = []
+    all_ep_id = []  # global episode id per step
+    all_t_in_ep = []  # timestep within that episode per step
+    ep_global = 0
 
     for m_idx, (xml_path, morph_vec) in enumerate(morph_specs):
         print(f"\n=== Collecting for morph {m_idx}: {morph_vec} ===")
@@ -626,6 +684,9 @@ def collect_quadruped_morph_trajectories(ppo_path: str,
                 all_obs.append(obs.astype(np.float32))
                 all_morph.append(np.asarray(morph_vec, dtype=np.float32))
 
+                all_ep_id.append(ep_global)
+                all_t_in_ep.append(step)
+
                 # policy action
                 action, _ = model.predict(obs, deterministic=deterministic)
                 next_obs, reward, done, truncated, info = env.step(action)
@@ -639,20 +700,57 @@ def collect_quadruped_morph_trajectories(ppo_path: str,
             env.close()
             print(f"  Morph {m_idx}, episode {ep} finished after {step} steps.")
 
-    # stack everything
     obs   = np.vstack(all_obs)        # (T, obs_dim)
     act   = np.vstack(all_act)        # (T, act_dim)
-    rew   = np.asarray(all_rew)       # (T,)
+    rew   = np.asarray(all_rew)
     morph = np.vstack(all_morph)      # (T, morph_dim)
+    ep_id = np.asarray(all_ep_id, dtype=np.int32)
+    t_in_ep = np.asarray(all_t_in_ep, dtype=np.int32)
 
     print("\nFinal shapes:")
     print("  obs  :", obs.shape)
     print("  act  :", act.shape)
     print("  rew  :", rew.shape)
     print("  morph:", morph.shape)
+    print("  ep_id :", ep_id.shape)
+    print("  t_in_ep:", t_in_ep.shape)
 
-    np.savez(out_path, obs=obs, act=act, rew=rew, morph=morph)
+    np.savez(out_path, obs=obs, act=act, rew=rew, morph=morph, ep_id=ep_id, t_in_ep=t_in_ep)
     print(f"Saved trajectories to {out_path}")
+
+class WeightScheduleCallback(BaseCallback):
+    def __init__(self, imitation_schedule, energy_schedule, verbose=0):
+        super().__init__(verbose)
+        self.imitation_schedule = imitation_schedule
+        self.energy_schedule = energy_schedule
+
+    def _on_step(self) -> bool:
+        # progress_remaining ∈ [1, 0]
+        progress = self.model._current_progress_remaining
+
+        imit_w = float(self.imitation_schedule(progress))
+        energy_w = float(self.energy_schedule(progress))
+
+        # unwrap VecEnv → Dummy/Subproc → gym env
+        vec = self.training_env
+        while hasattr(vec, "venv"):
+            vec = vec.venv
+
+        if hasattr(vec, "envs"):  # DummyVecEnv
+            for e in vec.envs:
+                env = e
+                while hasattr(env, "env"):
+                    env = env.env
+                env.imitation_weight = imit_w
+                env.energy_weight = energy_w
+        else:
+            vec.env_method("set_imitation_weight", imit_w)
+            vec.env_method("set_energy_weight", energy_w)
+
+        if self.verbose and self.n_calls % 2048 == 0:
+            print(f"[sched] imitation_w={imit_w:.3f}, energy_w={energy_w:.5f}")
+
+        return True
 
 class RewardDebugCallback(BaseCallback):
 
@@ -679,6 +777,7 @@ class RewardDebugCallback(BaseCallback):
                 "velocity_reward": 0.0,
                 "imitation_reward": 0.0,
                 "fail_penalty": 0.0,
+                "phase_speed": 0.0,
             })
 
     def _on_step(self) -> bool:
@@ -699,6 +798,7 @@ class RewardDebugCallback(BaseCallback):
             s["velocity_reward"] += info.get("velocity_reward", 0.0)
             s["imitation_reward"] += info.get("imitation_reward", 0.0)
             s["energy_penalty"] += info.get("energy_penalty", 0.0)
+            s["phase_speed"] += info.get("phase_speed", 0.0)
 
 
             # update xml path if present
@@ -720,6 +820,7 @@ class RewardDebugCallback(BaseCallback):
                     f"alive={s['alive_reward'] / L: .3f} | "
                     f"energy_p={s['energy_penalty'] / L: .3f} | "
                     f"fail={s['fail_penalty'] / L: .3f} | "
+                    f"phase_spd={s['phase_speed'] / L: .3f} | "
                     f"var={xml}"
                 )
 
